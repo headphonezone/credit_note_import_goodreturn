@@ -44,7 +44,7 @@ SALES_LEDGER_MAP = {
 # UNICOMMERCE AUTH & API (with retry for any error)
 # ─────────────────────────────────────────────
 
-def get_uc_token(password: str) -> str:
+def get_uc_token(password: str, retries: int = 3) -> str:
     url = f"{UC_BASE}/oauth/token"
     params = {
         "grant_type": "password",
@@ -52,9 +52,17 @@ def get_uc_token(password: str) -> str:
         "username": UC_USERNAME,
         "password": password,
     }
-    r = requests.get(url, params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()["access_token"]
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            return r.json()["access_token"]
+        except requests.exceptions.RequestException:
+            if attempt == retries - 1:
+                raise
+            wait = 2 ** attempt
+            time.sleep(wait)
+    raise RuntimeError("Failed to get token after retries")
 
 def uc_headers(token: str) -> dict:
     return {
@@ -151,6 +159,15 @@ def fetch_order_data(display_order_code: str, token: str) -> dict:
     shipping_pincode = shipping_addr.get("pincode", "")
     shipping_state_name = shipping_addr.get("stateName", shipping_addr.get("state", ""))
 
+    # ─── GST Registration ────────────────────────────
+    customer_gstin = so_dto.get("customerGSTIN") or ""
+    if customer_gstin and customer_gstin.strip():
+        gst_reg_type = "Regular"
+        gstin_value = customer_gstin.strip()
+    else:
+        gst_reg_type = "Unregistered/Consumer"
+        gstin_value = ""
+
     return {
         "sale_order_code":  sale_order_code,
         "invoice_display":  invoice_display,
@@ -166,6 +183,8 @@ def fetch_order_data(display_order_code: str, token: str) -> dict:
         "shipping_pincode": shipping_pincode,
         "shipping_state":   shipping_state_name,
         "place_of_supply":  billing_state_name,
+        "gst_reg_type":     gst_reg_type,
+        "gstin":            gstin_value,
         "raw_so":           so_dto,
     }
 
@@ -233,34 +252,14 @@ def read_sheet_raw(sheet_url: str, gcp_creds: dict) -> pd.DataFrame:
 
     df.columns = df.columns.str.strip()
 
-    # ─── Robust date parsing with comma support ──
-    ts_series = df["Timestamp"].astype(str).str.strip()
-
-    # Try explicit formats (with and without comma)
-    formats = [
-        "%d/%m/%Y, %H:%M:%S",
-        "%d-%m-%Y, %H:%M:%S",
-        "%d/%m/%Y %H:%M:%S",
-        "%d-%m-%Y %H:%M:%S",
-        "%d.%m.%Y %H:%M:%S",
-        "%m/%d/%Y %H:%M:%S",
-        "%m-%d-%Y %H:%M:%S",
-        "%Y-%m-%d %H:%M:%S",
-    ]
-    parsed = pd.Series(index=ts_series.index, dtype="datetime64[ns]")
-    for fmt in formats:
-        parsed = pd.to_datetime(ts_series, format=fmt, errors="coerce")
-        if not parsed.isna().all():
-            break
-    # If all failed, fall back to pandas' flexible parser with dayfirst
-    if parsed.isna().all():
-        parsed = pd.to_datetime(ts_series, dayfirst=True, errors="coerce")
-    df["Timestamp"] = parsed
+    # ─── Clean timestamp: remove commas, then parse ──
+    df["Timestamp"] = df["Timestamp"].astype(str).str.strip().str.replace(",", " ")
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], dayfirst=True, errors="coerce")
 
     return df
 
 # ─────────────────────────────────────────────
-# TALLY EXCEL BUILDER (no round-off)
+# TALLY EXCEL BUILDER (with GST Registration fields)
 # ─────────────────────────────────────────────
 
 TALLY_COLUMNS = [
@@ -280,6 +279,8 @@ TALLY_COLUMNS = [
     "Buyer/Supplier - Address",
     "Buyer/Supplier - Pincode",
     "Buyer/Supplier - State",
+    "Buyer/Supplier - GST Registration Type",
+    "Buyer/Supplier - GSTIN/UIN",
     "Buyer/Supplier - Place of Supply",
     "Consignee - Address",
     "Consignee - Pincode",
@@ -371,7 +372,6 @@ def build_excel(credit_notes: list[dict]) -> bytes:
 
         col = {v: i for i, v in enumerate(TALLY_COLUMNS)}
 
-        # Exact total (no rounding)
         party_credit = round(total_item_amt + total_cgst + total_sgst + total_igst + total_cod, 2)
 
         # ── Party Ledger (Cr) – linked to original Order ID ──
@@ -389,13 +389,19 @@ def build_excel(credit_notes: list[dict]) -> bytes:
         row1[col["Bill Name"]] = cn["order_no"]
         row1[col["Bill Amount"]] = party_credit
         row1[col["Bill Amount - Dr/Cr"]] = "Cr"
+
+        # Party details
         row1[col["Buyer/Supplier - Address"]] = cn.get("billing_address", "")
         row1[col["Buyer/Supplier - Pincode"]] = cn.get("billing_pincode", "")
         row1[col["Buyer/Supplier - State"]] = cn.get("billing_state", "")
+        row1[col["Buyer/Supplier - GST Registration Type"]] = cn.get("gst_reg_type", "Unregistered/Consumer")
+        row1[col["Buyer/Supplier - GSTIN/UIN"]] = cn.get("gstin", "")
         row1[col["Buyer/Supplier - Place of Supply"]] = cn.get("place_of_supply", cn.get("billing_state", ""))
+
         row1[col["Consignee - Address"]] = cn.get("shipping_address", "")
         row1[col["Consignee - Pincode"]] = cn.get("shipping_pincode", "")
         row1[col["Consignee - State"]] = cn.get("shipping_state", "")
+
         row1[col["Original Invoice No."]] = cn["invoice_no"]
         row1[col["Original Invoice - Date"]] = cn["invoice_date"]
         row1[col["Nature of Original Sales"]] = "B2C (Small)"
@@ -461,6 +467,7 @@ def build_excel(credit_notes: list[dict]) -> bytes:
         "Ledger Name": 35, "Ledger Amount": 14, "Ledger Amount Dr/Cr": 8,
         "Bill Type of Ref": 12, "Bill Name": 16, "Bill Amount": 14, "Bill Amount - Dr/Cr": 10,
         "Buyer/Supplier - Address": 40, "Buyer/Supplier - Pincode": 14, "Buyer/Supplier - State": 20,
+        "Buyer/Supplier - GST Registration Type": 20, "Buyer/Supplier - GSTIN/UIN": 20,
         "Buyer/Supplier - Place of Supply": 20,
         "Consignee - Address": 40, "Consignee - Pincode": 14, "Consignee - State": 20,
         "Item Name": 50, "Actual Quantity": 8, "Billed Quantity": 8,
@@ -594,8 +601,6 @@ st.markdown("""
 st.title("📋 HPZ Credit Note Generator")
 st.caption("Goods Return · Pulls data from RMS Google Sheet + Unicommerce · Exports Tally-ready Excel")
 
-# ─── No sidebar inputs – all secrets read directly ───
-
 col1, col2 = st.columns(2)
 with col1:
     from_date = st.date_input("From Date", value=date.today() - timedelta(days=30))
@@ -610,7 +615,7 @@ st.divider()
 generate_btn = st.button("🚀 Generate Credit Notes", width='stretch')
 
 if generate_btn:
-    # ─── Read all secrets ──────────────────────────
+    # ─── Read secrets ──────────────────────────────
     try:
         uc_password = st.secrets["UC_PASSWORD"]
         sheet_url = st.secrets["SHEET_ID"]
@@ -637,7 +642,6 @@ if generate_btn:
     try:
         progress.progress(5, text="Reading Google Sheet…")
         raw_df = read_sheet_raw(sheet_url, gcp_creds)
-        
 
         if raw_df.empty:
             st.error("No data returned from the sheet. Check the tab name and permissions.")
@@ -704,6 +708,8 @@ if generate_btn:
                     "shipping_pincode": order_data.get("shipping_pincode", ""),
                     "shipping_state": order_data.get("shipping_state", ""),
                     "place_of_supply": order_data.get("place_of_supply", order_data.get("billing_state", "")),
+                    "gst_reg_type": order_data.get("gst_reg_type", "Unregistered/Consumer"),
+                    "gstin": order_data.get("gstin", ""),
                 })
                 log(f"Order #{order_no} → Invoice {invoice_no} · {len(matched_items)} item(s)")
 
@@ -721,14 +727,15 @@ if generate_btn:
 
         progress.progress(100, text="Done!")
 
-        # ─── Summary + Download ──────────────────
-        st.divider()
-        col1, col2, col3, col4 = st.columns([1,1,1,2])
-        col1.metric("Orders processed", len(unique_orders))
-        col2.metric("Credit notes ready", len(credit_notes))
-        col3.metric("Errors", len(errors))
-        with col4:
-            st.write("")
+        # ─── Clear real-time log box ────────────────────
+        log_box.empty()
+
+        # ─── TOP: Success + Download button ──────────────
+        st.success(f"✅ {len(credit_notes)} credit notes ready for download!")
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.write(f"**{len(unique_orders)}** orders processed, **{len(errors)}** errors.")
+        with col2:
             filename = f"CreditNotes_{from_date.strftime('%d%b%Y')}_to_{to_date.strftime('%d%b%Y')}.xlsx"
             st.download_button(
                 label="⬇️  Download Excel",
@@ -738,11 +745,25 @@ if generate_btn:
                 width='stretch',
             )
 
+        # ─── Processing logs (now static) ──────────────────
+        if logs:
+            st.subheader("📝 Processing Logs")
+            st.code("\n".join(logs), language="text")
+
+        # ─── Metrics ──────────────────────────────────────
+        st.divider()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Orders processed", len(unique_orders))
+        c2.metric("Credit notes ready", len(credit_notes))
+        c3.metric("Errors", len(errors))
+
+        # ─── Errors expander ────────────────────────────
         if errors:
             with st.expander("⚠️ Orders with errors"):
                 for e in errors:
                     st.error(e)
 
+        # ─── Preview Table ─────────────────────────────
         st.subheader("📊 Preview (Item-level)")
         preview_rows = []
         for cn in credit_notes:
