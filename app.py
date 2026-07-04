@@ -232,8 +232,31 @@ def read_sheet_raw(sheet_url: str, gcp_creds: dict) -> pd.DataFrame:
         return df
 
     df.columns = df.columns.str.strip()
-    df["Timestamp"] = df["Timestamp"].astype(str).str.strip()
-    df["Timestamp"] = pd.to_datetime(df["Timestamp"], dayfirst=True, errors="coerce")
+
+    # ─── Robust date parsing with comma support ──
+    ts_series = df["Timestamp"].astype(str).str.strip()
+
+    # Try explicit formats (with and without comma)
+    formats = [
+        "%d/%m/%Y, %H:%M:%S",
+        "%d-%m-%Y, %H:%M:%S",
+        "%d/%m/%Y %H:%M:%S",
+        "%d-%m-%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M:%S",
+        "%m/%d/%Y %H:%M:%S",
+        "%m-%d-%Y %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+    parsed = pd.Series(index=ts_series.index, dtype="datetime64[ns]")
+    for fmt in formats:
+        parsed = pd.to_datetime(ts_series, format=fmt, errors="coerce")
+        if not parsed.isna().all():
+            break
+    # If all failed, fall back to pandas' flexible parser with dayfirst
+    if parsed.isna().all():
+        parsed = pd.to_datetime(ts_series, dayfirst=True, errors="coerce")
+    df["Timestamp"] = parsed
+
     return df
 
 # ─────────────────────────────────────────────
@@ -571,14 +594,7 @@ st.markdown("""
 st.title("📋 HPZ Credit Note Generator")
 st.caption("Goods Return · Pulls data from RMS Google Sheet + Unicommerce · Exports Tally-ready Excel")
 
-with st.sidebar:
-    st.header("⚙️ Configuration")
-    uc_password = st.text_input("Unicommerce Password", type="password", value=st.secrets.get("UC_PASSWORD", ""))
-    sheet_url = st.text_input("Google Sheet URL / ID", value=st.secrets.get("SHEET_ID", ""))
-    st.subheader("🔑 GCP Service Account")
-    gcp_creds_json = st.text_area("Paste service account JSON", value=st.secrets.get("GCP_SA_JSON", ""), height=120)
-    st.divider()
-    st.caption("v1.0 · HPZ Ops Tool")
+# ─── No sidebar inputs – all secrets read directly ───
 
 col1, col2 = st.columns(2)
 with col1:
@@ -594,14 +610,19 @@ st.divider()
 generate_btn = st.button("🚀 Generate Credit Notes", width='stretch')
 
 if generate_btn:
-    if not uc_password or not sheet_url or not gcp_creds_json:
-        st.error("Please fill all configuration fields in the sidebar.")
+    # ─── Read all secrets ──────────────────────────
+    try:
+        uc_password = st.secrets["UC_PASSWORD"]
+        sheet_url = st.secrets["SHEET_ID"]
+        gcp_creds_json = st.secrets["GCP_SA_JSON"]
+    except KeyError as e:
+        st.error(f"Missing secret: {e}. Please add it to your .streamlit/secrets.toml or Streamlit Cloud secrets.")
         st.stop()
 
     try:
         gcp_creds = json.loads(gcp_creds_json)
     except json.JSONDecodeError:
-        st.error("Invalid service account JSON.")
+        st.error("Invalid GCP service account JSON in secrets.")
         st.stop()
 
     progress = st.progress(0, text="Starting…")
@@ -616,6 +637,7 @@ if generate_btn:
     try:
         progress.progress(5, text="Reading Google Sheet…")
         raw_df = read_sheet_raw(sheet_url, gcp_creds)
+        
 
         if raw_df.empty:
             st.error("No data returned from the sheet. Check the tab name and permissions.")
@@ -706,7 +728,7 @@ if generate_btn:
         col2.metric("Credit notes ready", len(credit_notes))
         col3.metric("Errors", len(errors))
         with col4:
-            st.write("")  # vertical spacer to align button
+            st.write("")
             filename = f"CreditNotes_{from_date.strftime('%d%b%Y')}_to_{to_date.strftime('%d%b%Y')}.xlsx"
             st.download_button(
                 label="⬇️  Download Excel",
@@ -716,13 +738,11 @@ if generate_btn:
                 width='stretch',
             )
 
-        # ─── Errors expander ──────────────────────
         if errors:
             with st.expander("⚠️ Orders with errors"):
                 for e in errors:
                     st.error(e)
 
-        # ─── Preview Table (Item-level) ──────────
         st.subheader("📊 Preview (Item-level)")
         preview_rows = []
         for cn in credit_notes:
