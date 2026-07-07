@@ -16,8 +16,7 @@ import traceback
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-UC_BASE      = "http://129.154.230.19/unicommerce"
-UC_DOMAIN    = "https://hpz.unicommerce.com"
+UC_BASE      = "http://129.154.230.19/unicommerce"   # Internal IP for all calls
 UC_USERNAME  = "yashasavi@headphonezone.in"
 UC_FACILITY  = "Warehouse"
 GODOWN       = "Chennai Wh -Good"
@@ -41,8 +40,14 @@ SALES_LEDGER_MAP = {
 }
 
 # ─────────────────────────────────────────────
-# UNICOMMERCE AUTH & API (with retry for any error)
+# UNICOMMERCE AUTH & API (all use internal IP)
 # ─────────────────────────────────────────────
+
+def get_public_ip() -> str:
+    try:
+        return requests.get('https://api.ipify.org', timeout=5).text
+    except:
+        return "unknown"
 
 def get_uc_token(password: str, retries: int = 3) -> str:
     url = f"{UC_BASE}/oauth/token"
@@ -56,7 +61,7 @@ def get_uc_token(password: str, retries: int = 3) -> str:
         try:
             r = requests.get(url, params=params, timeout=30)
             if r.status_code == 403:
-                raise ValueError(f"403 Forbidden on token: {r.text}")
+                raise ValueError(f"403 Forbidden on token: {r.text[:200]}")
             r.raise_for_status()
             token = r.json().get("access_token", "").strip()
             if not token:
@@ -71,19 +76,23 @@ def get_uc_token(password: str, retries: int = 3) -> str:
 
 def uc_headers(token: str) -> dict:
     return {
-        "Authorization": f"Bearer {token}",   # Capital B
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
         "Facility": UC_FACILITY,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json, text/plain, */*",
     }
 
 def search_sale_order(display_order_code: str, token: str, retries: int = 3) -> dict | None:
-    url = f"{UC_DOMAIN}/services/rest/v1/oms/saleOrder/search"
+    # Use internal IP for search as well
+    url = f"{UC_BASE}/services/rest/v1/oms/saleOrder/search"
     payload = {"displayOrderCode": display_order_code}
     for attempt in range(retries):
         try:
             r = requests.post(url, json=payload, headers=uc_headers(token), timeout=15)
             if r.status_code == 403:
-                raise ValueError(f"403 Forbidden: {r.text}")
+                public_ip = get_public_ip()
+                raise ValueError(f"403 Forbidden from IP {public_ip}. Please whitelist this IP or use internal network. Response: {r.text[:300]}")
             r.raise_for_status()
             data = r.json()
             if not data.get("successful"):
@@ -108,7 +117,8 @@ def get_sale_order(sale_order_code: str, token: str, retries: int = 3) -> dict:
         try:
             r = requests.post(url, json=payload, headers=uc_headers(token), timeout=20)
             if r.status_code == 403:
-                raise ValueError(f"403 Forbidden: {r.text}")
+                public_ip = get_public_ip()
+                raise ValueError(f"403 Forbidden from IP {public_ip}. Please whitelist this IP or use internal network. Response: {r.text[:300]}")
             r.raise_for_status()
             data = r.json()
             if not data.get("successful"):
