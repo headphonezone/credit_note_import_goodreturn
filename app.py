@@ -55,8 +55,13 @@ def get_uc_token(password: str, retries: int = 3) -> str:
     for attempt in range(retries):
         try:
             r = requests.get(url, params=params, timeout=30)
+            if r.status_code == 403:
+                raise ValueError(f"403 Forbidden on token: {r.text}")
             r.raise_for_status()
-            return r.json()["access_token"]
+            token = r.json().get("access_token", "").strip()
+            if not token:
+                raise ValueError("Empty token received")
+            return token
         except requests.exceptions.RequestException:
             if attempt == retries - 1:
                 raise
@@ -66,7 +71,7 @@ def get_uc_token(password: str, retries: int = 3) -> str:
 
 def uc_headers(token: str) -> dict:
     return {
-        "Authorization": f"bearer {token}",
+        "Authorization": f"Bearer {token}",   # Capital B
         "Content-Type": "application/json",
         "Facility": UC_FACILITY,
     }
@@ -77,6 +82,8 @@ def search_sale_order(display_order_code: str, token: str, retries: int = 3) -> 
     for attempt in range(retries):
         try:
             r = requests.post(url, json=payload, headers=uc_headers(token), timeout=15)
+            if r.status_code == 403:
+                raise ValueError(f"403 Forbidden: {r.text}")
             r.raise_for_status()
             data = r.json()
             if not data.get("successful"):
@@ -100,6 +107,8 @@ def get_sale_order(sale_order_code: str, token: str, retries: int = 3) -> dict:
     for attempt in range(retries):
         try:
             r = requests.post(url, json=payload, headers=uc_headers(token), timeout=20)
+            if r.status_code == 403:
+                raise ValueError(f"403 Forbidden: {r.text}")
             r.raise_for_status()
             data = r.json()
             if not data.get("successful"):
@@ -786,4 +795,3 @@ if generate_btn:
         st.error(f"Unexpected error: {ex}")
         with st.expander("Traceback"):
             st.code(traceback.format_exc())
-# new code b
