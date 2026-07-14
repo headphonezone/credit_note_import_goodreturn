@@ -16,7 +16,8 @@ import traceback
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-UC_BASE      = "http://129.154.230.19/unicommerce"   # Internal IP for all calls
+UC_BASE      = "http://129.154.230.19/unicommerce"
+UC_DOMAIN    = "https://hpz.unicommerce.com"
 UC_USERNAME  = "yashasavi@headphonezone.in"
 UC_FACILITY  = "Warehouse"
 GODOWN       = "Chennai Wh -Good"
@@ -40,14 +41,8 @@ SALES_LEDGER_MAP = {
 }
 
 # ─────────────────────────────────────────────
-# UNICOMMERCE AUTH & API (all use internal IP)
+# UNICOMMERCE AUTH & API (with retry for any error)
 # ─────────────────────────────────────────────
-
-def get_public_ip() -> str:
-    try:
-        return requests.get('https://api.ipify.org', timeout=5).text
-    except:
-        return "unknown"
 
 def get_uc_token(password: str, retries: int = 3) -> str:
     url = f"{UC_BASE}/oauth/token"
@@ -61,7 +56,7 @@ def get_uc_token(password: str, retries: int = 3) -> str:
         try:
             r = requests.get(url, params=params, timeout=30)
             if r.status_code == 403:
-                raise ValueError(f"403 Forbidden on token: {r.text[:200]}")
+                raise ValueError(f"403 Forbidden on token: {r.text}")
             r.raise_for_status()
             token = r.json().get("access_token", "").strip()
             if not token:
@@ -76,23 +71,19 @@ def get_uc_token(password: str, retries: int = 3) -> str:
 
 def uc_headers(token: str) -> dict:
     return {
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"Bearer {token}",   # Capital B
         "Content-Type": "application/json",
         "Facility": UC_FACILITY,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json, text/plain, */*",
     }
 
 def search_sale_order(display_order_code: str, token: str, retries: int = 3) -> dict | None:
-    # Use internal IP for search as well
-    url = f"{UC_BASE}/services/rest/v1/oms/saleOrder/search"
+    url = f"{UC_DOMAIN}/services/rest/v1/oms/saleOrder/search"
     payload = {"displayOrderCode": display_order_code}
     for attempt in range(retries):
         try:
             r = requests.post(url, json=payload, headers=uc_headers(token), timeout=15)
             if r.status_code == 403:
-                public_ip = get_public_ip()
-                raise ValueError(f"403 Forbidden from IP {public_ip}. Please whitelist this IP or use internal network. Response: {r.text[:300]}")
+                raise ValueError(f"403 Forbidden: {r.text}")
             r.raise_for_status()
             data = r.json()
             if not data.get("successful"):
@@ -117,8 +108,7 @@ def get_sale_order(sale_order_code: str, token: str, retries: int = 3) -> dict:
         try:
             r = requests.post(url, json=payload, headers=uc_headers(token), timeout=20)
             if r.status_code == 403:
-                public_ip = get_public_ip()
-                raise ValueError(f"403 Forbidden from IP {public_ip}. Please whitelist this IP or use internal network. Response: {r.text[:300]}")
+                raise ValueError(f"403 Forbidden: {r.text}")
             r.raise_for_status()
             data = r.json()
             if not data.get("successful"):
@@ -144,6 +134,7 @@ def fetch_order_data(display_order_code: str, token: str) -> dict:
     pkg = pkgs[0]
 
     invoice_display = pkg.get("invoiceDisplayCode") or pkg.get("invoiceCode", "")
+    invoice_irn = pkg.get("irn") or ""
     invoice_date_ms = pkg.get("invoiceDate")
     if invoice_date_ms:
         invoice_date_str = datetime.fromtimestamp(invoice_date_ms / 1000).strftime("%d-%m-%Y")
@@ -204,6 +195,7 @@ def fetch_order_data(display_order_code: str, token: str) -> dict:
         "place_of_supply":  billing_state_name,
         "gst_reg_type":     gst_reg_type,
         "gstin":            gstin_value,
+        "irn":              invoice_irn,
         "raw_so":           so_dto,
     }
 
@@ -321,6 +313,10 @@ TALLY_COLUMNS = [
     "Original Invoice No.",
     "Original Invoice - Date",
     "Nature of Original Sales",
+    "Reason for Issuing Note",
+    "e-Invoice - Ack No.",
+    "e-Invoice - Ack Date",
+    "e-Invoice - IRN",
     "Change Mode",
 ]
 
@@ -423,7 +419,13 @@ def build_excel(credit_notes: list[dict]) -> bytes:
 
         row1[col["Original Invoice No."]] = cn["invoice_no"]
         row1[col["Original Invoice - Date"]] = cn["invoice_date"]
-        row1[col["Nature of Original Sales"]] = "B2C (Small)"
+        row1[col["Reason for Issuing Note"]] = "01-Sales Return"
+        if cn.get("gst_reg_type") == "Regular":
+            # Registered customer: e-invoice details instead of B2C nature
+            row1[col["Nature of Original Sales"]] = "Not Applicable"
+            row1[col["e-Invoice - IRN"]] = cn.get("irn", "")
+        else:
+            row1[col["Nature of Original Sales"]] = "B2C (Small)"
         row1[col["Change Mode"]] = "Item Invoice"
         ws.append(row1)
         _style_row(ws, row_num, data_font, fill, border)
@@ -496,7 +498,9 @@ def build_excel(credit_notes: list[dict]) -> bytes:
         "Item Allocations - UOM": 8, "Item Allocations - Rate": 12,
         "Item Allocations - Rate per": 10, "Item Allocations - Amount": 12,
         "Original Invoice No.": 22, "Original Invoice - Date": 13,
-        "Nature of Original Sales": 18, "Change Mode": 14,
+        "Nature of Original Sales": 18, "Reason for Issuing Note": 18,
+        "e-Invoice - Ack No.": 16, "e-Invoice - Ack Date": 13, "e-Invoice - IRN": 40,
+        "Change Mode": 14,
     }
     for col_idx, col_name in enumerate(TALLY_COLUMNS, 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = col_widths.get(col_name, 12)
@@ -729,6 +733,7 @@ if generate_btn:
                     "place_of_supply": order_data.get("place_of_supply", order_data.get("billing_state", "")),
                     "gst_reg_type": order_data.get("gst_reg_type", "Unregistered/Consumer"),
                     "gstin": order_data.get("gstin", ""),
+                    "irn": order_data.get("irn", ""),
                 })
                 log(f"Order #{order_no} → Invoice {invoice_no} · {len(matched_items)} item(s)")
 
