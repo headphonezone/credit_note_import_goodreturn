@@ -16,8 +16,7 @@ import traceback
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-UC_BASE      = "http://129.154.230.19/unicommerce"
-UC_DOMAIN    = "https://hpz.unicommerce.com"
+UC_BASE      = "http://129.154.230.19/unicommerce"  # proxy VM; must forward all routes below to hpz.unicommerce.com
 UC_USERNAME  = "yashasavi@headphonezone.in"
 UC_FACILITY  = "Warehouse"
 GODOWN       = "Chennai Wh -Good"
@@ -77,7 +76,7 @@ def uc_headers(token: str) -> dict:
     }
 
 def search_sale_order(display_order_code: str, token: str, retries: int = 3) -> dict | None:
-    url = f"{UC_DOMAIN}/services/rest/v1/oms/saleOrder/search"
+    url = f"{UC_BASE}/services/rest/v1/oms/saleOrder/search"
     payload = {"displayOrderCode": display_order_code}
     for attempt in range(retries):
         try:
