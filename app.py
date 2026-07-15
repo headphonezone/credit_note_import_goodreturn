@@ -16,7 +16,8 @@ import traceback
 # ─────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────
-UC_BASE      = "http://129.154.230.19/unicommerce"  # proxy VM; must forward all routes below to hpz.unicommerce.com
+UC_BASE      = "http://129.154.230.19/unicommerce"  # proxy VM (fixed IP)
+UC_DOMAIN    = "https://hpz.unicommerce.com"         # direct Unicommerce API
 UC_USERNAME  = "yashasavi@headphonezone.in"
 UC_FACILITY  = "Warehouse"
 GODOWN       = "Chennai Wh -Good"
@@ -75,26 +76,40 @@ def uc_headers(token: str) -> dict:
         "Facility": UC_FACILITY,
     }
 
-def search_sale_order(display_order_code: str, token: str, retries: int = 3) -> dict | None:
-    url = f"{UC_BASE}/services/rest/v1/oms/saleOrder/search"
+def _try_search(url: str, payload: dict, token: str) -> tuple[dict | None, str]:
+    """Returns (element_or_None, diagnostic_string). Never raises."""
+    try:
+        r = requests.post(url, json=payload, headers=uc_headers(token), timeout=15)
+        body_preview = (r.text or "")[:300]
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code} @ {url} :: {body_preview}"
+        data = r.json()
+        if not data.get("successful"):
+            return None, f"successful=false @ {url} :: {data.get('errors')}"
+        elements = data.get("elements", [])
+        if not elements:
+            return None, f"no elements @ {url}"
+        return elements[0], f"OK @ {url}"
+    except requests.exceptions.RequestException as e:
+        return None, f"NETWORK ERROR @ {url} :: {type(e).__name__}: {e}"
+
+def search_sale_order(display_order_code: str, token: str) -> dict | None:
     payload = {"displayOrderCode": display_order_code}
-    for attempt in range(retries):
-        try:
-            r = requests.post(url, json=payload, headers=uc_headers(token), timeout=15)
-            if r.status_code == 403:
-                raise ValueError(f"403 Forbidden: {r.text}")
-            r.raise_for_status()
-            data = r.json()
-            if not data.get("successful"):
-                raise ValueError(f"UC search failed: {data.get('errors')}")
-            elements = data.get("elements", [])
-            return elements[0] if elements else None
-        except requests.exceptions.RequestException:
-            if attempt == retries - 1:
-                raise
-            wait = 2 ** attempt
-            time.sleep(wait)
-    return None
+    direct_url = f"{UC_DOMAIN}/services/rest/v1/oms/saleOrder/search"
+    proxy_url  = f"{UC_BASE}/services/rest/v1/oms/saleOrder/search"
+
+    # 1) Try DIRECT to Unicommerce (how it always worked before)
+    element, direct_diag = _try_search(direct_url, payload, token)
+    if element:
+        return element
+
+    # 2) Fall back to the proxy VM
+    element, proxy_diag = _try_search(proxy_url, payload, token)
+    if element:
+        return element
+
+    # Both failed — surface the exact reasons so we can see what's really going on
+    raise ValueError(f"search failed.\n  DIRECT: {direct_diag}\n  PROXY:  {proxy_diag}")
 
 def get_sale_order(sale_order_code: str, token: str, retries: int = 3) -> dict:
     url = f"{UC_BASE}/oms/saleorder/get"
